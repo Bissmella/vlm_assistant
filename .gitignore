@@ -44,6 +44,7 @@ data/*.mp4
 /tmp/
 *.tmp
 *.log
+scripts.md
 
 # OS-specific
 Thumbs.db
@@ -59,3 +60,6 @@ internal/
 data/videos/
 data/videos_full/
 data/videos.zip
+
+
+output/

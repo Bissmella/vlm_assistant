@@ -20,14 +20,24 @@ from pathlib import Path
 from typing import Dict, Any
 from datetime import datetime
 from dataclasses import asdict
-
+import cv2
 import requests
 import numpy as np
+import base64
+import asyncio
+import threading
+import concurrent.futures
+import io
+import wave
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.harness import StreamingHarness
 from src.data_loader import load_procedure_json, validate_procedure_format
+from src.prompt import prompts
+from stats.step_stats import step_stats
+
+
 
 
 # ==========================================================================
@@ -38,7 +48,7 @@ def call_vlm(
     api_key: str,
     frame_base64: str,
     prompt: str,
-    model: str = "google/gemini-2.5-flash",
+    model: str = "google/gemma-4-26b-a4b-it", #"google/gemini-2.5-flash",
     stream: bool = False,
 ) -> str:
     """
@@ -105,6 +115,252 @@ def call_vlm(
 
 
 # ==========================================================================
+# STT API HELPER (provided — feel free to modify)
+# ==========================================================================
+def pcm_to_wav_bytes(pcm_bytes):
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(16000)
+        wf.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+def call_stt(
+    api_key: str,
+    audio_data,
+    model: str = "google/gemini-2.0-flash-001", #"google/gemini-2.5-flash-lite", #"google/gemini-2.5-flash",#"mistralai/voxtral-small-24b-2507", #"google/gemini-2.5-flash",
+    stream: bool = False,
+) -> str:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "https://github.com/alcorlabs/realtime-vlm-playground",
+        "X-Title": "Realtime VLM Playground - STT",
+    }
+    audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "You are an accurate transcriber. Transcribe the spoken audio verbatim. Do not guess or hallucinate. If unclear, noisy, or silent ONLY return 'silence'"}, #an empty string
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_b64,  # Use the encoded string, not raw bytes
+                            "format": "wav"   # Gemini supports pcm16 directly
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        # Use json=payload which handles the dictionary-to-JSON conversion
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        
+        if resp.status_code != 200:
+            print(f"STT API Error Details: {resp.text}")
+            
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[STT Error] {e}")
+        return ""
+    
+
+
+# ==========================================================================
+# Step State Manager
+# ==========================================================================
+
+class StepStateManager:
+    def __init__(self, procedure: dict):
+        self.procedure = procedure
+        self.steps = sorted(procedure["steps"], key=lambda x: x["step_id"])
+
+        self.current_step_id = 1
+        self.completed_steps: list[int] = []
+        self.events_history = []
+
+        self.step_start_time = 0.0  
+
+    # --- Step Access ---
+    def get_current_step(self):
+        return self.steps[self.current_step_id - 1]
+        
+
+    def get_current_step_id(self):
+        return self.current_step_id
+
+    def get_next_expected_step(self):
+        if self.current_step_id < len(self.steps):
+            step = self.steps[self.current_step_id]
+            return step["description"]
+        else:
+            return "No more steps"
+
+    def update_step(self,):
+        """
+        probably a more general update step doing current one step or jump update
+        """
+        pass
+
+    # --- Step Progression (STRICT CONTROL) ---
+    def complete_current_step(self, timestamp: float):
+        """
+        Only valid way to advance step.
+        """
+        if self.current_step_id in self.completed_steps:
+            return False  # already done
+
+        self.completed_steps.append(self.current_step_id)
+
+        self.add_event(
+            event="step_completion",
+            timestep=timestamp,
+            step_id=self.current_step_id,
+        )
+
+        self.current_step_id += 1
+        self.step_start_time = timestamp  #reset timer
+
+        return True
+
+    # --- Recovery Jump (CONTROLLED) ---
+    def jump_to_step(self, step_id: int, timestamp: float):
+        """
+        Used ONLY in recovery mode.
+        """
+        if step_id <= self.current_step_id:
+            return False
+
+        # limit jump size (important)
+        if step_id > self.current_step_id + 3:
+            return False
+
+        self.current_step_id = step_id
+        self.step_start_time = timestamp
+
+        return True
+
+    # --- Events ---
+    def add_event(self, event, timestep):
+        if event == "error_detected":
+            desc = f"Error at step {self.current_step_id}"
+        elif event == "step_completion":
+            desc = f"Step {self.current_step_id} completed"
+        else:
+            desc = "Unknown event"
+
+        self.events_history.append((timestep, event, self.current_step_id, desc))
+
+    def get_event_history(self, max_items=5):
+        """
+        Keep history SHORT (important for prompt quality)
+        """
+        recent = self.events_history[-max_items:]
+        message = ""
+        for t, e, step_id, desc in recent:
+            message += f"Time: {t:.1f}, {desc}\n"
+        return message
+
+    # --- Timing ---
+    def get_time_in_step(self, current_time: float):
+        return current_time - self.step_start_time
+
+    # --- Prompt Context ---
+    def get_prompt_context(self, mode="strict") -> str:
+        step = self.get_current_step()
+        if mode == "strict":
+            return json.dumps({
+                "procedure_title": self.procedure.get("task_name", "Unknown"),
+                "current_step_id": self.current_step_id,
+                "current_step_description": step["description"] if step else "None",
+                "next_step_description": self.get_next_expected_action(),
+            }, indent=2)
+        else:
+            return json.dumps({
+                "procedure_title": self.procedure.get("task_name", "Unknown"),
+                "current_step_id": self.current_step_id,
+                "steps": self.steps,
+            }, indent=2)
+            
+
+def decide_mode(
+    current_step_id: int,
+    time_in_step: float,
+    step_time_stats: dict= step_stats,
+):
+    """
+    Realtime-safe mode decision using only per-step timing.
+
+    Returns:
+        mode: "strict" | "watchful" | "recovery"
+        debug: dict
+    """
+
+    stats = step_time_stats.get(current_step_id, None)
+
+    if stats is None:
+        return "strict", {}
+
+    mean = stats["mean"]
+    std = max(stats["std"], 1e-3)
+
+    # Optional: clamp extreme std (important for your data)
+    std = min(std, mean * 2)
+
+    z_score = (time_in_step - mean) / std
+
+    # --- thresholds ---
+    Z_STRICT = 1.0
+    Z_WATCHFUL = 2.0
+
+    if z_score < Z_STRICT:
+        mode = "strict"
+
+    elif z_score < Z_WATCHFUL:
+        mode = "watchful"
+
+    else:
+        mode = "recovery"
+
+    debug = {
+        "z_score": z_score,
+        "time_in_step": time_in_step,
+        "expected_mean": mean,
+        "std": std,
+    }
+
+    return mode, debug
+
+# ==========================================================================
+# Helper function - getting procedure description
+# ==========================================================================
+
+def get_desc(procedure : dict) -> str:
+    name = procedure.get("task_name", "Unknown task")
+    desc = procedure.get("description", "No description provided.")
+    safety = procedure.get("safety_notes", "None")
+
+    steps_list = procedure.get("steps", [])
+    formatted_steps = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps_list)])
+
+    return f"""
+        Procedure name: {name}
+        Description: {desc}
+        Safety notes: {safety}
+        STEPS:
+            {formatted_steps}
+        """
+
+
+# ==========================================================================
 # YOUR PIPELINE — IMPLEMENT THESE CALLBACKS
 # ==========================================================================
 
@@ -129,7 +385,28 @@ class Pipeline:
         self.procedure = procedure
         self.task_name = procedure.get("task") or procedure.get("task_name", "Unknown")
         self.steps = procedure["steps"]
+        
+        self.state = StepStateManager(procedure)
+        self.last_frame = None
+        self.last_vlm_call_time = 0.0
+        self.audio_buffer = [] #list of (timestamp, transcript)
+        self.system_prompt = prompts["v1"]
+        self.desc_history = []
+        self.proc_context = get_desc(procedure=procedure)
+        
+        self.vlm_calls = 0
+        self.strict_calls = 0 #strict cheap vlm calls
+        self.exp_calls = 0      # expensive vlm model calls.
 
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._pending_futures = []
+        self._last_submitted_time = 0.0
+        self._state_lock = threading.Lock()
+
+        #audio
+        self.audio_accumulator = b""
+        self._audio_lock = threading.Lock()
+        self.last_stt_call_time = 0.0
         # TODO: Initialize your pipeline state here
         # Examples:
         #   self.current_step = 0
@@ -162,7 +439,107 @@ class Pipeline:
                 "spoken_response": "Stop — you need to turn off the power first.",
             })
         """
-        pass  # TODO: Implement
+        if self.last_frame is not None:
+            diff = cv2.absdiff(self.last_frame, frame)
+            motion_score = cv2.mean(diff)[0]
+            significant_change = motion_score > 15.0
+        else:
+            significant_change = True
+        self.last_frame = frame.copy()
+        # Throttle VLM calls to avoid rate limits: require a minimum
+        # interval between calls even if significant motion is detected.
+        min_interval = 2.0
+        should_call = (
+            significant_change and
+            (timestamp_sec - self.last_vlm_call_time > min_interval)
+            ) or (timestamp_sec - self.last_vlm_call_time >3.0)
+        
+        if should_call:
+            self.last_vlm_call_time = timestamp_sec
+            self.vlm_calls +=1
+            mode, _ = decide_mode(self.state.current_step_id, self.state.get_time_in_step(timestamp_sec))
+            print("****MODE**: ", mode)
+            if mode == "strict":
+                self.strict_calls +=1
+            else:
+                self.exp_calls +=1
+            #snapshot shared state before handing off to worker
+            with self._state_lock:
+                snapshot_step_id    = self.state.current_step_id
+                snapshot_step_time  = self.state.step_start_time
+                snapshot_obs        = list(self.desc_history[-5:])
+                snapshot_events     = self.state.get_event_history()
+            self._executor.submit(
+                self._call_and_emit,
+                frame_base64,
+                timestamp_sec,
+                snapshot_step_id,
+                snapshot_step_time,
+                snapshot_obs,
+                snapshot_events,
+                mode
+            )
+    
+    def _call_and_emit(self, 
+                       frame_base64: str, 
+                       timestamp_sec: float,
+                       step_id: int,
+                       step_start_time: float,
+                       obs_history: list,
+                       events_history: str,
+                       mode: str,
+                       ):
+        """
+            Runs in background thread. Does VLM call + emits event.
+        """
+        try:
+            response = self._call_vlm(
+                frame_base64,
+                timestamp_sec,
+                step_id,
+                step_start_time,
+                obs_history,
+                events_history,
+                mode
+            )
+        except Exception as e:
+            print(f" [pipeline] VLM call failed: {e}")
+            return
+        
+        if response is None:
+            return
+        
+        with self._state_lock:
+            self.desc_history.append(
+                f"Up to {timestamp_sec} seconds: {response['observation']}"
+            )
+            if response["event_type"] == "step_completion":
+                if self.state.current_step_id == step_id: #gurad against stale worker
+                    self.state.complete_current_step(timestamp_sec)
+                    self.harness.emit_event({
+                        "timestamp_sec": timestamp_sec,
+                        "type": "step_completion",  # or "error_detected" or "idle_detected"
+                        "step_id": step_id,
+                        "confidence": response["confidence"],
+                        "description": response["description"],
+                        "source": "video",
+                        "vlm_observation": response["observation"],
+                    })
+                    
+            elif response["event_type"] == "error_detected":
+                    self.state.add_event(response["event_type"], timestamp_sec)
+                    self.harness.emit_event({
+                    "timestamp_sec": timestamp_sec,
+                    "type": "error_detected",  # or "error_detected" or "idle_detected"
+                    "step_id": step_id,
+                    "confidence": response["confidence"],
+                    "description": response["description"],
+                    "source": "video",
+                    "vlm_observation": response["observation"],
+                    "spoken_response": response["speech"],
+                    })
+                    
+        
 
     def on_audio(self, audio_bytes: bytes, start_sec: float, end_sec: float):
         """
@@ -177,7 +554,191 @@ class Pipeline:
         Consider: speech-to-text, keyword detection, silence detection.
         The instructor's verbal corrections are a strong signal for errors.
         """
-        pass  # TODO: Implement
+        CHUNK_SECONDS = 3.0
+        BYTES_PER_SECOND = 16000 * 2  # 16kHz * 16-bit
+        CHUNK_SIZE = int(CHUNK_SECONDS * BYTES_PER_SECOND)
+        with self._audio_lock:
+            self.audio_accumulator += audio_bytes
+
+            if len(self.audio_accumulator) < CHUNK_SIZE:
+                return
+            
+            chunk = self.audio_accumulator[:CHUNK_SIZE]
+
+            self.audio_accumulator = self.audio_accumulator[CHUNK_SIZE:]
+
+        #preventing too many requests
+        # if getattr(self, "_stt_in_flight", False):
+        #     return
+
+        self._stt_in_flight = True
+
+        with self._state_lock:
+            step_id_snapshot = self.state.current_step_id
+
+        self._executor.submit(
+            self._stt_worker_thread,
+            chunk,
+            end_sec,
+            step_id_snapshot
+        )
+
+        # 3. Trigger every ~1 second (assuming the harness sends chunks often)
+        # Check if 1 second has passed since the last STT call
+        if end_sec - self.last_stt_call_time >= 1.0:
+            self.last_stt_call_time = end_sec
+            
+            with self._audio_lock:
+                snapshot_audio = self.audio_accumulator
+            
+            with self._state_lock:
+                snapshot_step_id = self.state.current_step_id
+
+            # Send to worker
+            self._executor.submit(
+                self._stt_worker_thread, 
+                snapshot_audio, 
+                end_sec, 
+                snapshot_step_id
+            )
+        #print(self.audio_buffer)
+       
+
+    def _call_vlm(
+            self, 
+            frame_base64: str, 
+            timestamp_sec: float,
+            step_id: int,
+            step_start_time: float,
+            obs_history: list,
+            events_history: str,
+            mode: str,
+        ):
+        if mode == "strict":
+            task_description = json.dumps({
+                "procedure_title": self.procedure.get("task_name", "Unknown"),
+                "current_step_id": step_id,
+                "current_step_description": self.state.steps[step_id - 1]["description"],
+                "next_step_description": (
+                    self.state.steps[step_id]["description"]
+                    if step_id < len(self.state.steps) else "No more steps"
+                ),
+            }, indent=2)
+            model = "google/gemini-2.5-flash-lite"
+        else:# mode == "watchfull":
+            task_description = self.state.get_prompt_context("watchfull")
+            model = "google/gemini-2.5-flash"
+
+        recent_audio = self.audio_buffer[-4:]
+        recent_transcript = " ".join([f"{time}: {t}\n" for time, t in recent_audio])
+        #recent_transcript = recent_transcript.split(". ")[-3:]
+        recent_obs = self.desc_history[-5:]
+        obs_str = "\n".join(obs_history)
+        #print("here2")
+        prompt = self.system_prompt.format(
+                task_description = task_description,
+                seconds = timestamp_sec,
+                #cur_step = self.state.get_current_step(),
+                events_history = events_history,
+                obs_history = obs_str,
+                speech = recent_transcript,
+        )
+        print("*****", prompt)
+        raw = call_vlm(
+            self.api_key,
+            frame_base64,
+            prompt,
+            stream=True,
+            model=model
+        )
+        #print("in call_vlm: ", raw)
+        # The model is instructed to return strict JSON, but the API
+        # returns a string. Parse JSON safely and provide a sensible
+        # fallback if parsing fails so downstream code can index keys.
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                return parsed
+            except json.JSONDecodeError:
+                # Try to extract a JSON object substring if the model
+                # included extra text or formatting around the JSON.
+                s = raw
+                start = s.find("{")
+                end = s.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        parsed = json.loads(s[start:end+1])
+                        return parsed
+                    except json.JSONDecodeError:
+                        pass
+                # Fallback: return a minimal structured dict so callers
+                # can safely read keys.
+                return {
+                    "observation": raw.strip(),
+                    "event_type": "none",
+                    "confidence": 0.0,
+                    "description": "",
+                    "speech": "",
+                }
+
+        if isinstance(raw, dict):
+            return raw
+
+        # Any other unexpected type -> stringify
+        return {
+            "observation": str(raw),
+            "event_type": "none",
+            "confidence": 0.0,
+            "description": "",
+            "speech": "",
+        }
+
+    def _stt_worker_thread(self, audio_data: bytes, timestamp: float, step_id: int):
+        try:
+            wav_bytes = pcm_to_wav_bytes(audio_data)
+            transcript = call_stt(self.api_key, wav_bytes)
+            # try:
+            #     data = json.loads(raw)
+            #     transcript = data.get("text", "").strip()
+            # except Exception:
+            #     return
+            if not transcript:
+                return
+            transcript = transcript.strip()
+
+            # Ignore garbage / tiny outputs
+            if len(transcript) < 3:
+                return
+
+            with self._state_lock:
+                if not self.audio_buffer:
+                    self.audio_buffer.append((timestamp, transcript))
+                    return
+
+                last_ts, last_text = self.audio_buffer[-1]
+
+                # ✅ Dedup logic (cleaner)
+                if transcript == last_text:
+                    return
+
+                if transcript.startswith(last_text):
+                    # model extended previous phrase
+                    self.audio_buffer[-1] = (timestamp, transcript)
+
+                elif last_text.endswith(transcript):
+                    # overlapping partial repeat → ignore
+                    return
+
+                else:
+                    # new phrase
+                    self.audio_buffer.append((timestamp, transcript))
+
+        except Exception as e:
+            print(f"!!! [STT Error]: {e}")
+
+        finally:
+            self._stt_in_flight = False
+
 
 
 # ==========================================================================
