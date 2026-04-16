@@ -14,7 +14,7 @@ flowchart TD
     subgraph "Vision Pipeline (on_frame)"
         Detect[Motion + Throttle]
         Decide{Call VLM?}
-        Mode[Mode Decision\n(strict/watchful/recovery)]
+        Mode["Mode Decision<br/>(strict/watchful/recovery)"]
         Snapshot[State Snapshot]
         AsyncVLM[Async VLM Worker]
 
