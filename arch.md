@@ -5,8 +5,8 @@ flowchart TD
     %% =========================
     Harness[Streaming Harness]
 
-    Harness -->|Frames| OnFrame[on_frame()]
-    Harness -->|Audio| OnAudio[on_audio()]
+    Harness -->|Frames| OnFrame["on_frame()"]
+    Harness -->|Audio| OnAudio["on_audio()"]
 
     %% =========================
     %% VISION PATH
