@@ -120,7 +120,10 @@ def call_vlm(
     else:
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        content = resp.json()["choices"][0]["message"]["content"]
+        input_tokens = len(prompt) // 4 + 258
+        output_tokens = len(content) // 4
+        return content, {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
 
 
 # ==========================================================================
@@ -192,11 +195,11 @@ def call_stt(
         content = resp.json()["choices"][0]["message"]["content"]
         input_tokens = len(prmpt) // 4 + 5 #5 seconds of audio
         output_tokens = len(content.strip()) // 4
-        if content:
-            return content.strip(), {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
+        content = content.strip() if content else ""
+        return content, {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
     except Exception as e:
         print(f"[STT Error] {e}")
-        return ""
+        return "", {"prompt_tokens": 0, "completion_tokens": 0}
     
 
 
@@ -416,6 +419,7 @@ class Pipeline:
         self._audio_lock = threading.Lock()
         self.last_stt_call_time = 0.0
         self.audio_buffer = [] #list of (timestamp, transcript)
+        self._stt_in_flight = False
 
         #error
         self.last_error_time = 0.0
