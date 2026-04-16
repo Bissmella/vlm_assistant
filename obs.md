@@ -1,5 +1,17 @@
 
 
+Between error detections:
+Minimum interval: 0.875 s
+Average interval: 15.803 s
+
+Errors per step:
+Maximum errors in a single step: 21
+Average errors per step: 0.5542
+
+
+
+
+
 First trial:
 model: google/gemma-4-26b-a4b-it
 video time: 176 seconds
