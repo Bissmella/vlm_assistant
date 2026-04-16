@@ -49,7 +49,7 @@ flowchart TD
         VLM[VLM Call]
         Parse[Parse JSON]
         Update[Update State]
-        Emit[emit_event()]
+        Emit["emit_event()"]
 
         VLM --> Parse --> Update --> Emit
     end
