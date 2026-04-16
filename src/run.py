@@ -24,7 +24,6 @@ import cv2
 import requests
 import numpy as np
 import base64
-import asyncio
 import threading
 import concurrent.futures
 import io
@@ -115,7 +114,7 @@ def call_vlm(
 
 
 # ==========================================================================
-# STT API HELPER (provided — feel free to modify)
+# STT API HELPER
 # ==========================================================================
 def pcm_to_wav_bytes(pcm_bytes):
     buffer = io.BytesIO()
@@ -129,9 +128,22 @@ def pcm_to_wav_bytes(pcm_bytes):
 def call_stt(
     api_key: str,
     audio_data,
-    model: str = "google/gemini-2.0-flash-001", #"google/gemini-2.5-flash-lite", #"google/gemini-2.5-flash",#"mistralai/voxtral-small-24b-2507", #"google/gemini-2.5-flash",
+    model: str = "google/gemini-2.0-flash-001", 
     stream: bool = False,
 ) -> str:
+    """
+    calls a model for audio trasncription.
+    Args:
+        api_key: openrouter api key
+        audio_data: audio data in wav format
+        model:  audio model to use.
+            some of other possible models:
+            "google/gemini-2.5-flash-lite", 
+            "google/gemini-2.5-flash",
+            "mistralai/voxtral-small-24b-2507", "google/gemini-2.5-flash",
+    Returns:
+        String of transcribed audio.
+    """
     url = "https://openrouter.ai/api/v1/chat/completions"
     
     headers = {
@@ -150,8 +162,8 @@ def call_stt(
                     {
                         "type": "input_audio",
                         "input_audio": {
-                            "data": audio_b64,  # Use the encoded string, not raw bytes
-                            "format": "wav"   # Gemini supports pcm16 directly
+                            "data": audio_b64,
+                            "format": "wav"
                         }
                     }
                 ]
@@ -160,7 +172,6 @@ def call_stt(
     }
 
     try:
-        # Use json=payload which handles the dictionary-to-JSON conversion
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         
         if resp.status_code != 200:
@@ -181,7 +192,14 @@ def call_stt(
 # ==========================================================================
 
 class StepStateManager:
+    """
+    Step state manager for managing the current step reached in the procedure. 
+    """
     def __init__(self, procedure: dict):
+        """
+        Args:
+            procedure: procedure dictionary including procedure description and steps.
+        """
         self.procedure = procedure
         self.steps = sorted(procedure["steps"], key=lambda x: x["step_id"])
 
@@ -191,7 +209,6 @@ class StepStateManager:
 
         self.step_start_time = 0.0  
 
-    # --- Step Access ---
     def get_current_step(self):
         return self.steps[self.current_step_id - 1]
         
@@ -206,21 +223,16 @@ class StepStateManager:
         else:
             return "No more steps"
 
-    def update_step(self,):
-        """
-        probably a more general update step doing current one step or jump update
-        """
-        pass
-
-    # --- Step Progression (STRICT CONTROL) ---
     def complete_current_step(self, timestamp: float):
         """
-        Only valid way to advance step.
+        Only valid way to advance one step.
+        Args:
+            timestamp: float timepstam in seconds - elapsed time
         """
         if self.current_step_id in self.completed_steps:
             return False  # already done
         if self.current_step_id > len(self.steps):
-            return False
+            return False #no more steps to do
         self.completed_steps.append(self.current_step_id)
 
         self.add_event(
@@ -234,22 +246,6 @@ class StepStateManager:
 
         return True
 
-    # --- Recovery Jump (CONTROLLED) ---
-    def jump_to_step(self, step_id: int, timestamp: float):
-        """
-        Used ONLY in recovery mode.
-        """
-        if step_id <= self.current_step_id:
-            return False
-
-        # limit jump size (important)
-        if step_id > self.current_step_id + 3:
-            return False
-
-        self.current_step_id = step_id
-        self.step_start_time = timestamp
-
-        return True
 
     # --- Events ---
     def add_event(self, event, timestep, step_id=None):
@@ -274,12 +270,18 @@ class StepStateManager:
                 message += f"Time: {t:.1f}, {desc}\n"
         return message
 
-    # --- Timing ---
     def get_time_in_step(self, current_time: float):
+        """
+        gets the amount of time spent on current step.
+        """
         return current_time - self.step_start_time
 
-    # --- Prompt Context ---
     def get_prompt_context(self, mode="strict") -> str:
+        """
+        gets context about the procedure, and current status.
+        Args:
+            mode:  "strict" | "watchful"
+        """
         step = self.get_current_step()
         if mode == "strict":
             return json.dumps({
@@ -304,6 +306,11 @@ def decide_mode(
     """
     Realtime-safe mode decision using only per-step timing.
 
+    Args:
+        current_step_id: current step in step state manager
+        time_in_step: amount of time spent in current step
+        step_time_stats: dictionary including mean, and std of time spent
+                        in each step extracted from data.
     Returns:
         mode: "strict" | "watchful" | "recovery"
         debug: dict
@@ -317,12 +324,10 @@ def decide_mode(
     mean = stats["mean"]
     std = max(stats["std"], 1e-3)
 
-    # Optional: clamp extreme std (important for your data)
     std = min(std, mean * 2)
 
     z_score = (time_in_step - mean) / std
 
-    # --- thresholds ---
     Z_STRICT = 1.0
     Z_WATCHFUL = 2.0
 
@@ -343,26 +348,6 @@ def decide_mode(
     }
 
     return mode, debug
-
-# ==========================================================================
-# Helper function - getting procedure description
-# ==========================================================================
-
-def get_desc(procedure : dict) -> str:
-    name = procedure.get("task_name", "Unknown task")
-    desc = procedure.get("description", "No description provided.")
-    safety = procedure.get("safety_notes", "None")
-
-    steps_list = procedure.get("steps", [])
-    formatted_steps = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps_list)])
-
-    return f"""
-        Procedure name: {name}
-        Description: {desc}
-        Safety notes: {safety}
-        STEPS:
-            {formatted_steps}
-        """
 
 
 # ==========================================================================
@@ -393,16 +378,21 @@ class Pipeline:
         
         self.state = StepStateManager(procedure)
         self.last_frame = None
+        self.last_vlm_frame = None
         self.last_vlm_call_time = 0.0
-        self.audio_buffer = [] #list of (timestamp, transcript)
-        self.system_prompt = prompts["v6"]
-        self.desc_history = []
-        self.proc_context = get_desc(procedure=procedure)
-        
-        self.vlm_calls = 0
-        self.strict_calls = 0 #strict cheap vlm calls
-        self.exp_calls = 0      # expensive vlm model calls.
+        self.last_frame_base64: str = ""
+        self.last_frame_timestamp: float = 0.0
 
+        self.system_prompt = prompts["v12"]
+        self.desc_history = []
+        self.vlm_calls = 0
+        #count of different modes calls
+        self.mode_counts = {"strict": 0, "watchful": 0, "recovery": 0}
+        #count of each model calls
+        self.model_counts = {}
+        self.total_cost = 0
+
+        #multithreading
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._pending_futures = []
         self._last_submitted_time = 0.0
@@ -412,55 +402,34 @@ class Pipeline:
         self.audio_accumulator = b""
         self._audio_lock = threading.Lock()
         self.last_stt_call_time = 0.0
+        self.audio_buffer = [] #list of (timestamp, transcript)
 
         #error
         self.last_error_time = 0.0
         self.last_error_step = -1
-        self.ERROR_COOLDOWN = 3.0
+        self.ERROR_COOLDOWN = 2.0
 
         self._emitted_completions = set()
-        # TODO: Initialize your pipeline state here
-        # Examples:
-        #   self.current_step = 0
-        #   self.completed_steps = set()
-        #   self.frame_buffer = []
-        #   self.last_activity_time = 0
-        #   self.api_calls = 0
-        #   self.total_cost = 0
 
     def on_frame(self, frame: np.ndarray, timestamp_sec: float, frame_base64: str):
         """
         Called by the harness for each video frame.
+        Decides to call a VLM or not and if yes, starts a thread for vlm calling and event emiting function
 
         Args:
             frame: BGR numpy array (raw frame)
             timestamp_sec: Current video timestamp
             frame_base64: Pre-encoded JPEG base64 string (ready for VLM API)
-
-        TODO: Implement your frame processing logic.
-        When you detect an event, call:
-            self.harness.emit_event({
-                "timestamp_sec": timestamp_sec,
-                "type": "step_completion",  # or "error_detected" or "idle_detected"
-                "step_id": 1,
-                "confidence": 0.9,
-                "description": "...",
-                "source": "video",
-                "vlm_observation": "...",
-                # For errors, also include:
-                "spoken_response": "Stop — you need to turn off the power first.",
-            })
         """
-        if self.last_frame is not None:
-            diff = cv2.absdiff(self.last_frame, frame)
+        if self.last_vlm_frame is not None:
+            diff = cv2.absdiff(self.last_vlm_frame, frame)
             motion_score = cv2.mean(diff)[0]
-            significant_change = motion_score > 15.0
+            significant_change = motion_score > 12.0
         else:
             significant_change = True
-        self.last_frame = frame.copy()
-        # Throttle VLM calls to avoid rate limits: require a minimum
-        # interval between calls even if significant motion is detected.
-        min_interval = 2.0
+        
+        #should a vlm call be done on current frame
+        min_interval = 1.6
         should_call = (
             significant_change and
             (timestamp_sec - self.last_vlm_call_time > min_interval)
@@ -468,13 +437,13 @@ class Pipeline:
         
         if should_call:
             self.last_vlm_call_time = timestamp_sec
+            self.last_vlm_frame = frame.copy()
+            self.last_frame_base64 = frame_base64
+            self.last_frame_timestamp = timestamp_sec
             self.vlm_calls +=1
             mode, _ = decide_mode(self.state.current_step_id, self.state.get_time_in_step(timestamp_sec))
+            self.mode_counts[mode] = self.mode_counts.get(mode, 0) + 1
             
-            if mode == "strict":
-                self.strict_calls +=1
-            else:
-                self.exp_calls +=1
             #snapshot shared state before handing off to worker
             with self._state_lock:
                 snapshot_step_id    = self.state.current_step_id
@@ -510,6 +479,16 @@ class Pipeline:
                        ):
         """
             Runs in background thread. Does VLM call + emits event.
+
+            Args:
+                frame_base64: the frame image
+                timestamp_sec: timestamp of procedure
+                step_id:  current step reached (from step state manager)
+                step_start_time:  time this step started (from step state manager)
+                obs_history:  previous observation history of vlm
+                events_history:  history of events detected so far
+                snapshot_speech:  speech transcribed from audio
+                mode:  mode for vlm (strict, watchful)
         """
         try:
             response = self._call_vlm(
@@ -529,57 +508,85 @@ class Pipeline:
         if response is None:
             return
         
+        """
+        This didn't make things better, but let it be here!
+        #Confidence gating: discard low-confidence events
+        conf = response.get("confidence", 0.0)
+        if not isinstance(conf, (int, float)):
+            try:
+                conf = float(conf)
+            except (ValueError, TypeError):
+                conf = 0.0
+        evt = response["event_type"]
+        # Step completion is catastrophic if wrong (cascades), so gate harder
+        if evt == "step_completion" and conf < 0.75:
+            response["event_type"] = "none"
+        elif evt == "error_detected" and conf < 0.50:
+            response["event_type"] = "none"
+        """
+        
         with self._state_lock:
             raw_obs = response['observation'].split('.')[0] + '.'
             self.desc_history.append(
                 f"time= {timestamp_sec} seconds: {raw_obs}"
             )
-            #potentially cap the size of desc_history to 10 or 20 to not grow forever
+            if len(self.desc_history) > 20:
+                self.desc_history = self.desc_history[-20:]
+            
+            # Minimum time-in-step guard: prevent premature completions
+            # from cascading into lost error detection
+            time_in_step = timestamp_sec - self.state.step_start_time
             if response["event_type"] == "step_completion":
-                if self.state.current_step_id == step_id: #gurad against stale worker
-                    self.state.complete_current_step(timestamp_sec)
-
+                if time_in_step < 2.0:
+                    response["event_type"] = "none"  # too early, likely hallucination
+            
+            if response["event_type"] == "step_completion":
+                if self.state.current_step_id == step_id: #guard against stale worker
                     if self.state.complete_current_step(timestamp_sec):
+                        #self._emitted_completions.add(step_id)
                         self.harness.emit_event({
                             "timestamp_sec": timestamp_sec,
-                            "type": "step_completion",  # or "error_detected" or "idle_detected"
+                            "type": "step_completion",
                             "step_id": step_id,
                             "confidence": response["confidence"],
                             "description": response["description"],
                             "source": "video",
                             "vlm_observation": response["observation"],
                         })
-                elif self.state.current_step_id == step_id + 1:
-                    if step_id not in self._emitted_completions:
-                        self._emitted_completions.add(step_id)
-                        self.harness.emit_event({
-                            "timestamp_sec": timestamp_sec,
-                            "type": "step_completion",  # or "error_detected" or "idle_detected"
-                            "step_id": step_id,
-                            "confidence": response["confidence"],
-                            "description": response["description"],
-                            "source": "video",
-                            "vlm_observation": response["observation"],
-                        })
+                # elif self.state.current_step_id == step_id + 1:
+                #     if step_id not in self._emitted_completions:
+                #         self._emitted_completions.add(step_id)
+                #         self.harness.emit_event({
+                #             "timestamp_sec": timestamp_sec,
+                #             "type": "step_completion",
+                #             "step_id": step_id,
+                #             "confidence": response["confidence"],
+                #             "description": response["description"],
+                #             "source": "video",
+                #             "vlm_observation": response["observation"],
+                #         })
                     
             elif response["event_type"] == "error_detected":
-                    time_since_last_error = timestamp_sec - self.last_error_time
-                    if time_since_last_error < self.ERROR_COOLDOWN:
-                        # still in cooldown, skip emission
+                    # Guard against stale worker emitting error for already-advanced step
+                    if self.state.current_step_id != step_id:
                         pass
                     else:
-                        self.last_error_time = timestamp_sec
-                        self.state.add_event(response["event_type"], timestamp_sec)
-                        self.harness.emit_event({
-                        "timestamp_sec": timestamp_sec,
-                        "type": "error_detected",  # or "error_detected" or "idle_detected"
-                        "step_id": step_id,
-                        "confidence": response["confidence"],
-                        "description": response["description"],
-                        "source": "video",
-                        "vlm_observation": response["observation"],
-                        "spoken_response": response["speech"],
-                        })
+                        time_since_last_error = timestamp_sec - self.last_error_time
+                        if time_since_last_error < self.ERROR_COOLDOWN:
+                            pass
+                        else:
+                            self.last_error_time = timestamp_sec
+                            self.state.add_event(response["event_type"], timestamp_sec)
+                            self.harness.emit_event({
+                            "timestamp_sec": timestamp_sec,
+                            "type": "error_detected",
+                            "step_id": step_id,
+                            "confidence": response["confidence"],
+                            "description": response["description"],
+                            "source": "video",
+                            "vlm_observation": response["observation"],
+                            "spoken_response": response["speech"],
+                            })
                     
         
 
@@ -596,7 +603,7 @@ class Pipeline:
         Consider: speech-to-text, keyword detection, silence detection.
         The instructor's verbal corrections are a strong signal for errors.
         """
-        CHUNK_SECONDS = 5.0
+        CHUNK_SECONDS = 4.0
         BYTES_PER_SECOND = 16000 * 2  # 16kHz * 16-bit
         CHUNK_SIZE = int(CHUNK_SECONDS * BYTES_PER_SECOND)
         with self._audio_lock:
@@ -621,26 +628,6 @@ class Pipeline:
             end_sec,
             step_id_snapshot
         )
-
-        # 3. Trigger every ~1 second (assuming the harness sends chunks often)
-        # Check if 1 second has passed since the last STT call
-        # if end_sec - self.last_stt_call_time >= 1.0:
-        #     self.last_stt_call_time = end_sec
-            
-        #     with self._audio_lock:
-        #         snapshot_audio = self.audio_accumulator
-            
-        #     with self._state_lock:
-        #         snapshot_step_id = self.state.current_step_id
-
-        #     # Send to worker
-        #     self._executor.submit(
-        #         self._stt_worker_thread, 
-        #         snapshot_audio, 
-        #         end_sec, 
-        #         snapshot_step_id
-        #     )
-        #print(self.audio_buffer)
        
 
     def _call_vlm(
@@ -654,28 +641,27 @@ class Pipeline:
             snapshot_speech: list,
             mode: str,
         ):
+
         if mode == "strict":
             task_description = json.dumps({
                 "procedure_title": self.procedure.get("task_name", "Unknown"),
                 "current_step_id": step_id,
                 "steps": self.state.steps,
-                # "current_step_description": self.state.steps[step_id - 1]["description"],
-                # "next_step_description": (
-                #     self.state.steps[step_id]["description"]
-                #     if step_id < len(self.state.steps) else "No more steps"
-                # ),
+                "time_in_current_step_sec": max(0.0, timestamp_sec - step_start_time),
             }, indent=2)
-            model = "google/gemini-2.5-flash"
-        else:# mode == "watchfull":
-            task_description = self.state.get_prompt_context("watchfull")
+            model = "google/gemini-2.5-flash"#"google/gemini-2.5-flash"
+        else:# mode == "watchful" or "recovery"
+            task_description = json.dumps({
+                "mode_hint": mode,
+                "current_step_id": step_id,
+                "time_in_current_step_sec": max(0.0, timestamp_sec - step_start_time),
+                "steps": self.state.steps,
+            }, indent=2)
             model = "openai/gpt-5.2-chat"
+        self.model_counts[model] = self.model_counts.get(model, 0) + 1
 
-        recent_audio = self.audio_buffer[-4:]
-        recent_transcript = "\n".join(snapshot_speech) if snapshot_speech else "No recent speech."#" ".join([f"{time}: {t}\n" for time, t in recent_audio])
-        #recent_transcript = recent_transcript.split(". ")[-3:]
-        recent_obs = self.desc_history[-5:]
+        recent_transcript = "\n".join(snapshot_speech) if snapshot_speech else "No recent speech."
         obs_str = "\n".join(obs_history)
-        #print("here2")
         prompt = self.system_prompt.format(
                 task_description = task_description,
                 seconds = timestamp_sec,
@@ -738,16 +724,10 @@ class Pipeline:
         try:
             wav_bytes = pcm_to_wav_bytes(audio_data)
             transcript = call_stt(self.api_key, wav_bytes)
-            # try:
-            #     data = json.loads(raw)
-            #     transcript = data.get("text", "").strip()
-            # except Exception:
-            #     return
             if not transcript:
                 return
             transcript = transcript.strip()
 
-            # Ignore garbage / tiny outputs
             if len(transcript) < 3:
                 return
 
@@ -758,12 +738,10 @@ class Pipeline:
 
                 last_ts, last_text = self.audio_buffer[-1]
 
-                # ✅ Dedup logic (cleaner)
                 if transcript == last_text:
                     return
 
                 if transcript.startswith(last_text):
-                    # model extended previous phrase
                     self.audio_buffer[-1] = (timestamp, transcript)
 
                 elif last_text.endswith(transcript):
@@ -856,6 +834,9 @@ def main():
     print()
     print(f"  Output: {args.output}")
     print(f"  Events: {len(results.events)}")
+    print(f"  VLM calls: {pipeline.vlm_calls}")
+    print(f"  Mode counts: {json.dumps(pipeline.mode_counts)}")
+    print(f"  Model counts: {json.dumps(pipeline.model_counts)}")
     print()
 
     if not results.events:

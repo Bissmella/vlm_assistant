@@ -33,4 +33,23 @@ video time: 176 seconds
   Events: 16
 
 
+Evaluation
+  VLM ORCHESTRATOR — EVALUATION REPORT  prompt v6
+============================================================
+  Tolerance: ±5s
+
+  STEP COMPLETION
+  --------------------------------------------------------
+    Precision:  54.5%
+    Recall:     54.5%
+    F1:         0.545
+    6/11 matched, 5 FP, 5 FN
+
+  ERROR DETECTION
+  --------------------------------------------------------
+    Precision:  33.3%
+    Recall:     16.7%
+    F1:         0.222
+    1/6 matched, 2 FP, 5 FN
+
 
