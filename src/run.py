@@ -252,7 +252,8 @@ class StepStateManager:
         return True
 
     # --- Events ---
-    def add_event(self, event, timestep):
+    def add_event(self, event, timestep, step_id=None):
+        step_id = step_id or self.current_step_id
         if event == "error_detected":
             desc = f"Error at step {self.current_step_id}"
         elif event == "step_completion":
@@ -285,7 +286,7 @@ class StepStateManager:
                 "procedure_title": self.procedure.get("task_name", "Unknown"),
                 "current_step_id": self.current_step_id,
                 "current_step_description": step["description"] if step else "None",
-                "next_step_description": self.get_next_expected_action(),
+                "next_step_description": self.get_next_expected_step(),
             }, indent=2)
         else:
             return json.dumps({
@@ -394,7 +395,7 @@ class Pipeline:
         self.last_frame = None
         self.last_vlm_call_time = 0.0
         self.audio_buffer = [] #list of (timestamp, transcript)
-        self.system_prompt = prompts["v1"]
+        self.system_prompt = prompts["v6"]
         self.desc_history = []
         self.proc_context = get_desc(procedure=procedure)
         
@@ -416,6 +417,8 @@ class Pipeline:
         self.last_error_time = 0.0
         self.last_error_step = -1
         self.ERROR_COOLDOWN = 3.0
+
+        self._emitted_completions = set()
         # TODO: Initialize your pipeline state here
         # Examples:
         #   self.current_step = 0
@@ -534,7 +537,21 @@ class Pipeline:
             #potentially cap the size of desc_history to 10 or 20 to not grow forever
             if response["event_type"] == "step_completion":
                 if self.state.current_step_id == step_id: #gurad against stale worker
+                    self.state.complete_current_step(timestamp_sec)
+
                     if self.state.complete_current_step(timestamp_sec):
+                        self.harness.emit_event({
+                            "timestamp_sec": timestamp_sec,
+                            "type": "step_completion",  # or "error_detected" or "idle_detected"
+                            "step_id": step_id,
+                            "confidence": response["confidence"],
+                            "description": response["description"],
+                            "source": "video",
+                            "vlm_observation": response["observation"],
+                        })
+                elif self.state.current_step_id == step_id + 1:
+                    if step_id not in self._emitted_completions:
+                        self._emitted_completions.add(step_id)
                         self.harness.emit_event({
                             "timestamp_sec": timestamp_sec,
                             "type": "step_completion",  # or "error_detected" or "idle_detected"
@@ -651,7 +668,7 @@ class Pipeline:
             model = "google/gemini-2.5-flash"
         else:# mode == "watchfull":
             task_description = self.state.get_prompt_context("watchfull")
-            model = "openai/gpt-5.2"
+            model = "openai/gpt-5.2-chat"
 
         recent_audio = self.audio_buffer[-4:]
         recent_transcript = "\n".join(snapshot_speech) if snapshot_speech else "No recent speech."#" ".join([f"{time}: {t}\n" for time, t in recent_audio])
