@@ -38,6 +38,14 @@ from stats.step_stats import step_stats
 
 
 
+# ==========================================================================
+# Used models rough cost (may have changed!)
+# ==========================================================================
+MODEL_PRICING = {
+    "google/gemini-2.5-flash": {"input": 0.213, "output": 2.50},
+    "google/gemini-2.0-flash-001": {"input": 0.100, "output": 0.398},
+    "openai/gpt-5.2-chat": {"input": 0.699, "output": 14.01},
+}
 
 # ==========================================================================
 # VLM API HELPER (provided — feel free to modify)
@@ -106,7 +114,9 @@ def call_vlm(
                         full_text += delta["content"]
                 except (json.JSONDecodeError, KeyError):
                     pass
-        return full_text
+        input_tokens = len(prompt) // 4 + 258
+        output_tokens = len(full_text) // 4
+        return full_text, {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
     else:
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
@@ -152,13 +162,14 @@ def call_stt(
         "X-Title": "Realtime VLM Playground - STT",
     }
     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+    prmpt = "You are an accurate transcriber. Transcribe the spoken audio verbatim. Do not guess or hallucinate. If unclear, noisy, or silent ONLY return 'silence'"
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "You are an accurate transcriber. Transcribe the spoken audio verbatim. Do not guess or hallucinate. If unclear, noisy, or silent ONLY return 'silence'"}, #an empty string
+                    {"type": "text", "text": prmpt}, #an empty string
                     {
                         "type": "input_audio",
                         "input_audio": {
@@ -179,8 +190,10 @@ def call_stt(
             
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
+        input_tokens = len(prmpt) // 4 + 5 #5 seconds of audio
+        output_tokens = len(content.strip()) // 4
         if content:
-            return content.strip()
+            return content.strip(), {"prompt_tokens": input_tokens, "completion_tokens": output_tokens}
     except Exception as e:
         print(f"[STT Error] {e}")
         return ""
@@ -553,18 +566,6 @@ class Pipeline:
                             "source": "video",
                             "vlm_observation": response["observation"],
                         })
-                # elif self.state.current_step_id == step_id + 1:
-                #     if step_id not in self._emitted_completions:
-                #         self._emitted_completions.add(step_id)
-                #         self.harness.emit_event({
-                #             "timestamp_sec": timestamp_sec,
-                #             "type": "step_completion",
-                #             "step_id": step_id,
-                #             "confidence": response["confidence"],
-                #             "description": response["description"],
-                #             "source": "video",
-                #             "vlm_observation": response["observation"],
-                #         })
                     
             elif response["event_type"] == "error_detected":
                     # Guard against stale worker emitting error for already-advanced step
@@ -671,14 +672,18 @@ class Pipeline:
                 speech = recent_transcript,
         )
         print("*****", prompt)
-        raw = call_vlm(
+        raw, usage = call_vlm(
             self.api_key,
             frame_base64,
             prompt,
             stream=True,
             model=model
         )
-        print(f"in {mode} call_vlm: ", raw)
+        pricing = MODEL_PRICING.get(model, {"input": 0, "output":0})
+        input_cost = usage.get("prompt_tokens", 0) * pricing["input"] / 1_000_000
+        output_cost = usage.get("completion_tokens", 0) * pricing["output"] / 1_000_000
+        with self._state_lock:
+            self.total_cost += input_cost + output_cost
         # The model is instructed to return strict JSON, but the API
         # returns a string. Parse JSON safely and provide a sensible
         # fallback if parsing fails so downstream code can index keys.
@@ -723,7 +728,12 @@ class Pipeline:
     def _stt_worker_thread(self, audio_data: bytes, timestamp: float, step_id: int):
         try:
             wav_bytes = pcm_to_wav_bytes(audio_data)
-            transcript = call_stt(self.api_key, wav_bytes)
+            transcript, usage = call_stt(self.api_key, wav_bytes)
+            pricing = MODEL_PRICING.get("google/gemini-2.0-flash-001", {"input":0, "output":0})
+            input_cost = usage.get("prompt_tokens", 0) * pricing["input"] / 1_000_000
+            output_cost = usage.get("completion_tokens", 0) * pricing["output"] / 1_000_000
+            with self._state_lock:
+                self.total_cost += input_cost + output_cost
             if not transcript:
                 return
             transcript = transcript.strip()
@@ -837,6 +847,7 @@ def main():
     print(f"  VLM calls: {pipeline.vlm_calls}")
     print(f"  Mode counts: {json.dumps(pipeline.mode_counts)}")
     print(f"  Model counts: {json.dumps(pipeline.model_counts)}")
+    print(f"  Estimated cost: ${pipeline.total_cost:.4f}")
     print()
 
     if not results.events:
