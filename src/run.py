@@ -675,7 +675,7 @@ class Pipeline:
                 obs_history = obs_str,
                 speech = recent_transcript,
         )
-        print("*****", prompt)
+        
         raw, usage = call_vlm(
             self.api_key,
             frame_base64,
